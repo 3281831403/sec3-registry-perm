@@ -42,7 +42,7 @@ ROLE_ALIASES = {
     "writer": "writer",
     "developer": "writer",
     "publisher": "writer",
-    "reader": "writer",
+    "reader": "reader",
     "viewer": "reader",
     "readonly": "reader",
 }
@@ -66,7 +66,7 @@ def parse_role(role):
             "scope": [str(item) for item in (role.get("scope") or [])],
         }
 
-    name = str(role or "")
+    name = str(role or "").strip().lower()
     if not name or name in ("anonymous", "guest"):
         return {
             "name": "anonymous",
@@ -90,7 +90,7 @@ def parse_role(role):
     return {
         "name": canonical,
         "push": table["push"],
-        "pull": table["push"],
+        "pull": table["pull"],
         "delete": table["delete"],
         "scope": [],
     }
@@ -137,7 +137,7 @@ def check_pull(role, namespace, anonymous):
     """
     perms = parse_role(role)
     if perms["name"] == "anonymous":
-        return anonymous is not False
+        return anonymous is True
     if not perms["pull"]:
         return False
     return _scope_allows(perms.get("scope"), namespace)
@@ -157,11 +157,15 @@ def _timestamp(now):
 
 
 def check_delete(role, now):
-    """Return True when the role may delete an image at the given time."""
+    """Return True when the role may delete an image at the given time.
+
+    Only administrators may delete, and a delete attempt must carry a
+    timestamp that can be parsed so the audit trail stays reconstructable.
+    """
     if not _timestamp(now):
         return False
     perms = parse_role(role)
-    return perms["delete"] or perms["name"] in ("admin", "writer")
+    return perms["name"] == "admin" and perms["delete"]
 
 
 def _namespace_view(namespace):
@@ -196,7 +200,13 @@ def check_inherit(namespace, parent):
     par = _namespace_view(parent)
     if child["parent"] != par["name"]:
         return False
-    return child["pull"] == par["pull"]
+    # A child may only tighten its parent: every flag the child grants must
+    # also be granted by the parent.  Any flag granted only by the child
+    # widens the permission boundary and makes the tree inconsistent.
+    for flag in FLAGS:
+        if child[flag] and not par[flag]:
+            return False
+    return True
 
 
 def _timestamp_text(now):
@@ -258,14 +268,17 @@ def authorize(request, policy, now):
     elif action == "delete":
         allowed = check_delete(role, now)
         reason = "delete_allowed" if allowed else "delete_denied"
-        return _decision(req, perms, allowed, reason, [])
     elif action == "rename":
         target = req.get("target")
         if not target:
             allowed = False
             reason = "rename_target_missing"
         else:
-            allowed = check_push(role, target)
+            # A rename moves an image out of the source namespace and into
+            # the target namespace, so both sides have to authorize the
+            # write independently; checking only the target would let a
+            # caller escape a source namespace they cannot write to.
+            allowed = check_push(role, namespace) and check_push(role, target)
             reason = "rename_allowed" if allowed else "rename_denied"
     else:
         allowed = False
@@ -307,11 +320,8 @@ def registry_batch(requests, policy, now):
     the outcome of a neighbour can never change a decision.
     """
     results = []
-    previous_role = None
     for index, request in enumerate(requests or []):
         item = dict(request or {})
-        previous_role = item.get("role", previous_role)
-        item["role"] = previous_role
         outcome = authorize(item, policy, now)
         outcome["index"] = index
         results.append(outcome)
